@@ -57,7 +57,7 @@ Put all dataset images under ./data/VOCdevkit2007/VOC2007/JPEGImages
 Put all dataset annotations (VOC format) under ./data/VOCdevkit2007/VOC2007/Annotations
 Put train.txt, val.txt, test.txt, and trainval.txt under ./data/VOCdevkit2007/VOC2007/ImageSets/Main
 
-Download pretrained weight from [our pretrained model][2] (only ResNet101) or [office model][3].
+Download pretrained weight from [our pretrained model][2] (based on ResNet101) with access code **1596** or [office model][3].
 
 ### 4. Train
 Modify ./lib/config/config.py:
@@ -78,7 +78,7 @@ Go to the root path and start to train:
 $ python train.py
 ```
 
-Note: At the beginning of the train, there may be some assert errors. The reason is there is an assert 'fg_num>0' in function 'iou_rotate_calculate3' of ./lib/utils/iou_rotate.py. At the beginning of the train, the network gets no foreground，thus, network cannot comput IoU between the predicted foreground box and its corresponding groundtruth bounding box. Such assert errors will not affect training process, you can ignore it. You can use our pretrained model to reduce such assert errors.
+Note: At the beginning of the train, there may be some assert errors. The reason is there is an assert 'fg_num>0' in function 'iou_rotate_calculate3' of ./lib/utils/iou_rotate.py. At the beginning of the train, the network gets no foreground，thus, network cannot comput IoU between the predicted foreground box and its corresponding groundtruth bounding box. Such assert errors will **not** affect training process, you can ignore it. You can use our pretrained model to reduce such assert errors.
 ### 5. Demo
 ```
 $ python demo.py
@@ -91,5 +91,5 @@ $ python eval_r.py
 
 
 [1]:https://github.com/yaqihan-9898/DOSR
-[2]: https://pan.baidu.com/s/1I7N0I_y2en2_PyYhMzuScg
+[2]: https://pan.baidu.com/s/1j-WRmj8da2yHsZP1odXfHg
 [3]: https://github.com/tensorflow/models/tree/master/research/slim
