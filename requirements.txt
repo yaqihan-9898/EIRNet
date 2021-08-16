@@ -1,0 +1,10 @@
+matplotlib
+tensorflow_gpu==1.10.0
+Cython
+opencv_python
+tensorflow_plot==0.3.2
+scipy
+numpy
+ipython
+Pillow
+skimage

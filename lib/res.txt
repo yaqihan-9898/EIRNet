@@ -1,0 +1,1110 @@
+# --------------------------------------------------------
+# Tensorflow Faster R-CNN
+# Licensed under The MIT License [see LICENSE for details]
+# Written by Xinlei Chen
+# --------------------------------------------------------
+
+
+import tensorflow as tf
+import tensorflow.contrib.slim as slim
+
+import lib.config.config as cfg
+from lib.nets.network import Network
+from lib.utils.tools import add_heatmap
+from tensorflow.contrib.slim.nets import resnet_v1
+from tensorflow.contrib.slim.nets import resnet_utils
+from tensorflow.contrib.slim.python.slim.nets.resnet_v1 import resnet_v1_block
+from lib.layer_utils import anchor_utils
+from lib.layer_utils.proposal_opr import postprocess_rpn_proposals
+from lib.layer_utils.anchor_target_layer_without_boxweight import anchor_target_layer
+from lib.layer_utils.proposal_target_layer_for_fpn import proposal_target_layer
+# from lib.nets.network.attention import build_attention
+
+def resnet_arg_scope(
+        is_training=True, weight_decay=cfg.FLAGS.weight_decay, batch_norm_decay=0.997,
+        batch_norm_epsilon=1e-5, batch_norm_scale=True):
+    '''
+
+    In Default, we do not use BN to train resnet, since batch_size is too small.
+    So is_training is False and trainable is False in the batch_norm params.
+
+    '''
+    batch_norm_params = {
+        'is_training': False, 'decay': batch_norm_decay,
+        'epsilon': batch_norm_epsilon, 'scale': batch_norm_scale,
+        'trainable': False,
+        'updates_collections': tf.GraphKeys.UPDATE_OPS
+    }
+
+    with slim.arg_scope(
+            [slim.conv2d],
+            weights_regularizer=slim.l2_regularizer(weight_decay),
+            weights_initializer=slim.variance_scaling_initializer(),
+            trainable=is_training,
+            activation_fn=tf.nn.relu,
+            normalizer_fn=slim.batch_norm,
+            normalizer_params=batch_norm_params):
+        with slim.arg_scope([slim.batch_norm], **batch_norm_params) as arg_sc:
+            return arg_sc
+
+class resnet(Network):
+    def __init__(self, batch_size=1, num_layers=101):
+        Network.__init__(self, batch_size=batch_size)
+        self._num_layers = num_layers
+        self._resnet_scope = 'resnet_v1_%d' % num_layers
+
+    def build_network(self, sess, is_training=True):
+
+        with tf.variable_scope('resnet_v1_101', 'resnet_v1_101'):  # 规定参数作用域，可以用reuse反复使用而不会创建新参数
+
+            # select initializer
+            if cfg.FLAGS.initializer == "truncated":
+                initializer = tf.truncated_normal_initializer(mean=0.0, stddev=0.01)
+                initializer_bbox = tf.truncated_normal_initializer(mean=0.0, stddev=0.001)
+            else:
+                initializer = tf.random_normal_initializer(mean=0.0, stddev=0.01)
+                initializer_bbox = tf.random_normal_initializer(mean=0.0, stddev=0.001)
+
+            # Build head
+        if cfg.FLAGS.attention == True:
+            if cfg.FLAGS.origin:
+                net, net_attention, net_attention_plus = self.build_head_origin(is_training, initializer, initializer_bbox)
+            else:
+                net, net_attention, net_attention_plus = self.build_head(is_training, initializer, initializer_bbox)
+
+            self._predictions["net_attention"] =net_attention
+            self._predictions["net_attention_plus"] = net_attention_plus
+        else:
+            net = self.build_head(is_training, initializer,initializer_bbox)
+
+            # Build rpn，在feature map上生成box的坐标和判断是否有物体
+            # rpn_cls_prob, 是shape=[None, self._num_anchors * 2]的框的分数是否有物体，进行二分类经过了softmax
+            # rpn_bbox_pred, 是shape=[None,w,h,self._num_anchors * 4] 是框的坐标，进行坐标回归
+            # rpn_cls_score,  是shape=[None,w,h,self._num_anchors * 2]的框的分数是否有物体，进行没有二分类经过了softmax
+            # rpn_cls_score_reshape ，是shape=[None, 2]的框分数，用于softmax的中间变量
+        with tf.variable_scope('resnet_v1_101', 'resnet_v1_101'):
+
+            rpn_cls_prob, rpn_bbox_pred, rpn_cls_score= self.build_rpn(net, is_training, initializer)  #[none,2],[none,4][none,2]
+
+            # Build proposals
+            # 还是筛选框rois，选择合适的框
+            rois = self.build_proposals(is_training, rpn_cls_prob, rpn_bbox_pred, rpn_cls_score)
+
+            # Build predictions
+            # cls_score 进行_num_classes的分类得分
+            # cls_prob 进行_num_classes的分类得分，经过softmax
+            # bbox_prediction 进行 box的回归
+
+        net=net[0]
+        # net = net[0]
+        if cfg.FLAGS.pre_ro == True:
+            if cfg.FLAGS.use_uplevel_labels == True:
+                cls_score, cls_prob, bbox_pred, cls_score_uplevel, cls_prob_uplevel, ro_bbox_pred = self.build_predictions(
+                    net,
+                    rois,
+                    is_training,
+                    initializer,
+                    initializer_bbox)
+                self._predictions["uplevel_cls_score"] = cls_score_uplevel  # 修改
+                self._predictions["uplevel_cls_prob"] = cls_prob_uplevel  # 修改
+                self._predictions["ro_bbox_pred"] = ro_bbox_pred
+                # self._predictions["uplevel_plus_cls_score"]=cls_score_uplevel_plus
+                # self._predictions["uplevel_plus_cls_prob"] = cls_prob_uplevel_plus
+            else:
+                cls_score, cls_prob, bbox_pred, ro_bbox_pred = self.build_predictions(net, rois, is_training,
+                                                                                      initializer,
+                                                                                      initializer_bbox)
+            self._predictions["ro_bbox_pred"] = ro_bbox_pred
+        else:
+            if cfg.FLAGS.use_uplevel_labels == True:
+                cls_score, cls_prob, bbox_pred, cls_score_uplevel, cls_prob_uplevel = self.build_predictions(
+                    net,
+                    rois,
+                    is_training,
+                    initializer,
+                    initializer_bbox)
+                self._predictions["uplevel_cls_score"] = cls_score_uplevel  # 修改
+                self._predictions["uplevel_cls_prob"] = cls_prob_uplevel  # 修改
+            else:
+                cls_score, cls_prob, bbox_pred = self.build_predictions(net, rois, is_training, initializer,
+                                                                        initializer_bbox)
+
+        self._predictions["rpn_cls_score"] = rpn_cls_score  # [none,2]
+        # self._predictions["rpn_cls_score_reshape"] = rpn_cls_score_reshape
+        self._predictions["rpn_cls_prob"] = rpn_cls_prob  # [none,2]
+        self._predictions["rpn_bbox_pred"] = rpn_bbox_pred  # [none,4]
+        self._predictions["cls_score"] = cls_score
+        self._predictions["cls_prob"] = cls_prob
+        self._predictions["bbox_pred"] = bbox_pred
+        self._predictions["rois"] = rois
+
+        self._score_summaries.update(self._predictions)
+
+        # rois 所有的rois框的坐标的分类得分
+        # cls_prob 进行_num_classes的分类得分，经过softmax
+        # bbox_prediction 进行 box的回归
+        return rois, cls_prob, bbox_pred
+
+
+    def get_variables_to_restore(self, variables, var_keep_dic):
+        variables_to_restore = []
+
+        for v in variables:
+            # exclude the first conv layer to swap RGB to BGR
+            if v.name == (self._resnet_scope + '/conv1/weights:0'):
+                self._variables_to_fix[v.name] = v
+                continue
+            if v.name.split(':')[0] in var_keep_dic:
+                print('Varibles restored: %s' % v.name)
+                variables_to_restore.append(v)
+
+        return variables_to_restore
+
+    def fix_variables(self, sess, pretrained_model):
+        print('Fix Resnet V1 layers..')
+        with tf.variable_scope('Fix_Resnet_V1') as scope:
+            with tf.device("/cpu:0"):
+                # fix RGB to BGR
+                conv1_rgb = tf.get_variable("conv1_rgb", [7, 7, 3, 64], trainable=False)
+                restorer_fc = tf.train.Saver({self._resnet_scope + "/conv1/weights": conv1_rgb})
+                restorer_fc.restore(sess, pretrained_model)
+                if cfg.FLAGS.continue_train:
+                    sess.run(tf.assign(self._variables_to_fix[self._resnet_scope + '/conv1/weights:0'],
+                                       conv1_rgb))
+                else:
+                    sess.run(tf.assign(self._variables_to_fix[self._resnet_scope + '/conv1/weights:0'],
+                                   tf.reverse(conv1_rgb, [2])))
+
+    def build_attention(self,inputs, is_training, initializer):
+        attention_conv3x3_1 = slim.conv2d(inputs, 256, [3, 3],
+                                          trainable=is_training,
+                                          weights_initializer=initializer,
+                                          activation_fn=tf.nn.relu,
+                                          scope='attention_conv/3x3_1')
+        attention_conv3x3_2 = slim.conv2d(attention_conv3x3_1, 256, [3, 3],
+                                          trainable=is_training,
+                                          weights_initializer=initializer,
+                                          activation_fn=tf.nn.relu,
+                                          scope='attention_conv/3x3_2')
+        attention_conv3x3_3 = slim.conv2d(attention_conv3x3_2, 256, [3, 3],
+                                          trainable=is_training,
+                                          weights_initializer=initializer,
+                                          activation_fn=tf.nn.relu,
+                                          scope='attention_conv/3x3_3')
+        attention_conv3x3_4 = slim.conv2d(attention_conv3x3_3, 256, [3, 3],
+                                          trainable=is_training,
+                                          weights_initializer=initializer,
+                                          activation_fn=tf.nn.relu,
+                                          scope='attention_conv/3x3_4')
+        attention_conv3x3_5 = slim.conv2d(attention_conv3x3_4, 2, [3, 3],
+                                          trainable=is_training,
+                                          weights_initializer=initializer,
+                                          activation_fn=None,
+                                          scope='attention_conv/3x3_5')
+        attention_conv3x3_6 = slim.conv2d(attention_conv3x3_4, 2, [3, 3],
+                                          trainable=is_training,
+                                          weights_initializer=initializer,
+                                          activation_fn=None,
+                                          scope='attention_conv/3x3_6')
+        return attention_conv3x3_5,attention_conv3x3_6
+
+    def fusion_two_layer(self,C_i, P_j, scope,channel):
+        '''
+        i = j+1
+        :param C_i: shape is [1, h, w, c]
+        :param P_j: shape is [1, h/2, w/2, 256]
+        :return:
+        P_i
+        '''
+        with tf.variable_scope(scope):
+            level_name = scope.split('_')[1]
+            h, w = tf.shape(C_i)[1], tf.shape(C_i)[2]
+            upsample_p = tf.image.resize_bilinear(P_j,
+                                                  size=[h, w],
+                                                  name='up_sample_' + level_name)
+
+
+            reduce_dim_c = slim.conv2d(C_i,
+                                       num_outputs=channel,
+                                       kernel_size=[1, 1], stride=1,
+                                       scope='reduce_dim_' + level_name)
+            if level_name =='P3':
+                reduce_dim_c = self.cbam_block(reduce_dim_c, 'cbam_C3')
+            add_f = 0.5 * upsample_p + 0.5 * reduce_dim_c
+
+            # P_i = slim.conv2d(add_f,
+            #                   num_outputs=256, kernel_size=[3, 3], stride=1,
+            #                   padding='SAME',
+            #                   scope='fusion_'+level_name)
+            return add_f
+
+    def build_head(self, is_training,initializer,initializer_bbox):
+        scope_name = 'resnet_v1_101'
+        if scope_name == 'resnet_v1_50':
+            middle_num_units = 6
+        elif scope_name == 'resnet_v1_101':
+            middle_num_units = 23
+        else:
+            raise NotImplementedError('We only support resnet_v1_50 or resnet_v1_101. Check your network name....yjr')
+        if cfg.FLAGS.P5_from_P4:
+            blocks = [resnet_v1_block('block1', base_depth=64, num_units=3, stride=2),
+                      resnet_v1_block('block2', base_depth=128, num_units=4, stride=2),
+                      # use stride 1 for the last conv4 layer.
+                      resnet_v1_block('block3', base_depth=256, num_units=middle_num_units, stride=1)]
+        else:
+            blocks = [resnet_v1_block('block1', base_depth=64, num_units=3, stride=2),
+                      resnet_v1_block('block2', base_depth=128, num_units=4, stride=2),
+                      resnet_v1_block('block3', base_depth=256, num_units=middle_num_units, stride=2),
+                      resnet_v1_block('block4', base_depth=512, num_units=3, stride=1)]
+        # when use fpn . stride list is [1, 2, 2]
+        with slim.arg_scope(resnet_arg_scope(is_training=False)):
+            with tf.variable_scope(scope_name, scope_name):
+                # Do the first few layers manually, because 'SAME' padding can behave inconsistently
+                # for images of different sizes: sometimes 0, sometimes 1
+                net = resnet_utils.conv2d_same(
+                    self._image, 64, 7, stride=2, scope='conv1')
+                net = tf.pad(net, [[0, 0], [1, 1], [1, 1], [0, 0]])
+                net = slim.max_pool2d(
+                    net, [3, 3], stride=2, padding='VALID', scope='pool1')
+
+        not_freezed = [False] * cfg.FLAGS.FIXED_BLOCKS + (4 - cfg.FLAGS.FIXED_BLOCKS) * [True]
+        # Fixed_Blocks can be 1~3
+        # net = tf.Print(net, [tf.shape(net)], summarize=10, message='C1_shape')
+        with slim.arg_scope(resnet_arg_scope(is_training=(is_training and not_freezed[0]))):
+            C2, end_points_C2 = resnet_v1.resnet_v1(net,
+                                                    blocks[0:1],
+                                                    global_pool=False,
+                                                    include_root_block=False,
+                                                    scope=scope_name)
+
+        # C2 = tf.Print(C2, [tf.shape(C2)], summarize=10, message='C2_shape')
+        # end_points_C2 = tf.Print(end_points_C2, [tf.shape(end_points_C2)], summarize=10, message='end_points_C2_shape')
+
+        with slim.arg_scope(resnet_arg_scope(is_training=(is_training and not_freezed[1]))):
+            C3, end_points_C3 = resnet_v1.resnet_v1(C2,
+                                                    blocks[1:2],
+                                                    global_pool=False,
+                                                    include_root_block=False,
+                                                    scope=scope_name)
+
+        # C3 = tf.Print(C3, [tf.shape(C3)], summarize=10, message='C3_shape')
+        # end_points_C3 = tf.Print(end_points_C3, [tf.shape(end_points_C3)], summarize=10, message='end_points_C3_shape')
+
+        with slim.arg_scope(resnet_arg_scope(is_training=(is_training and not_freezed[2]))):
+            C4, end_points_C4 = resnet_v1.resnet_v1(C3,
+                                        blocks[2:3],
+                                        global_pool=False,
+                                        include_root_block=False,
+                                        scope=scope_name)
+        # end_points_C4 = tf.Print(end_points_C4, [tf.shape(end_points_C4)], summarize=10,
+        #                              message='end_points_C4_shape')
+        if not cfg.FLAGS.P5_from_P4:
+            with slim.arg_scope(resnet_arg_scope(is_training=(is_training and not_freezed[2]))):
+                C5, end_points_C5 = resnet_v1.resnet_v1(C4,
+                                                        blocks[3:4],
+                                                        global_pool=False,
+                                                        include_root_block=False,
+                                                        scope=scope_name)
+
+        # end_points_C5 = tf.Print(end_points_C5, [tf.shape(end_points_C5)], summarize=10, message='end_points_C5_shape')
+
+
+        if cfg.FLAGS.P5_from_P4:
+            feature_dict = {'C2': end_points_C2['{}/block1/unit_2/bottleneck_v1'.format(scope_name)],
+                            'C3': end_points_C3['{}/block2/unit_3/bottleneck_v1'.format(scope_name)],
+                            'C4': C4}
+
+        else:
+            feature_dict = {'C2': end_points_C2['{}/block1/unit_2/bottleneck_v1'.format(scope_name)],
+                            'C3': end_points_C3['{}/block2/unit_3/bottleneck_v1'.format(scope_name)],
+                            'C4': end_points_C4[
+                                '{}/block3/unit_{}/bottleneck_v1'.format(scope_name, middle_num_units - 1)],
+                            'C5': end_points_C5['{}/block4/unit_3/bottleneck_v1'.format(scope_name)],
+                            # 'C5': end_points_C5['{}/block4'.format(scope_name)],
+                            }
+        # add_heatmap(feature_dict['C4'], name='Layer4/C4_heat')
+        # add_heatmap(feature_dict['C3'], name='Layer3/C3_heat')
+        # add_heatmap(feature_dict['C2'], name='Layer2/C2_heat')
+        # feature_dict = {'C2': C2,
+        #                 'C3': C3,
+        #                 'C4': C4,
+        #                 'C5': C5}
+
+        pyramid_dict = {}
+        with tf.variable_scope('build_pyramid'):
+            with slim.arg_scope([slim.conv2d], weights_regularizer=slim.l2_regularizer(cfg.FLAGS.weight_decay),
+                                activation_fn=None, normalizer_fn=None):
+                if cfg.FLAGS.P5_from_P4:
+                    P4 = slim.conv2d(C4,
+                                     num_outputs=256,
+                                     kernel_size=[1, 1],
+                                     stride=1, scope='build_P4')
+
+                    pyramid_dict['P4'] = P4
+                    P5 = slim.max_pool2d(P4, kernel_size=[1, 1], stride=2, scope='build_P5')
+                    pyramid_dict['P5'] = P5
+                else:
+                    P5 = slim.conv2d(C5,
+                                     num_outputs=256,
+                                     kernel_size=[1, 1],
+                                     stride=1, scope='build_P5')
+                    # P5 = tf.Print(P5, [tf.shape(P5)], summarize=10, message='P5_shape')
+                    pyramid_dict['P5'] = P5
+
+                if 'P6' in cfg.LEVLES:
+                    P6 = slim.max_pool2d(P5, kernel_size=[1, 1], stride=2, scope='build_P6')
+                    pyramid_dict['P6'] = P6
+
+                if cfg.FLAGS.P5_from_P4:
+                    high=3
+                else:
+                    high=4
+                for level in range(high, 1, -1):  # range(4, 1, -1) build [P4, P3, P2]
+
+                    pyramid_dict['P%d' % level] = self.fusion_two_layer(C_i=feature_dict["C%d" % level],
+                                                                        P_j=pyramid_dict["P%d" % (level + 1)],
+                                                                        scope='build_P%d' % level,channel=256)
+                # for level in range(high, 1, -1):  #range(4, 1, -1)
+                #     pyramid_dict['P%d' % level] = slim.conv2d(pyramid_dict['P%d' % level],
+                #                                               num_outputs=256, kernel_size=[3, 3], padding="SAME",
+                #                                               stride=1, scope="fuse_P%d" % level)
+        if cfg.FLAGS.attention == True:
+            with tf.variable_scope('build_attention',
+                                   regularizer=slim.l2_regularizer(cfg.FLAGS.weight_decay)):
+                # tf.summary.image('add_attention_before',
+                #                  tf.expand_dims(tf.reduce_mean(C4, axis=-1), axis=-1))
+
+                # SE_C4 =self.squeeze_excitation_layer(C4, 1024, 16, 'SE_C4', is_training,initializer)
+
+                add_heatmap(tf.expand_dims(tf.reduce_mean(pyramid_dict['P3'], axis=-1), axis=-1),
+                            'add_attention_before')
+                # add_heatmap(tf.expand_dims(C4[:, :, :, 0], axis=-1), 'add_attention_before_0')
+                # SE_C4 = self.channel_attention(C4, 'cbam_channel', mode=2)
+                # C4 = SE_C4 * C4
+                # add_heatmap(tf.expand_dims(tf.reduce_mean(C4, axis=-1), axis=-1), 'add_attention_after_channel')
+                # add_heatmap(tf.expand_dims(C4[:, :, :, 0], axis=-1), 'add_attention_after_0_channel')
+                # C4_stop = tf.stop_gradient(C4)
+                C4_attention_layer, C4_attention_layer_plus = self.build_attention(pyramid_dict['P3'], is_training,
+                                                                                   initializer)
+
+                # C4_attention_layer = self.build_inception_attention(C4_stop, is_training,initializer)
+
+                C4_attention = tf.nn.softmax(C4_attention_layer)  # [1 75 110 2]
+                C4_attention_plus = tf.nn.softmax(C4_attention_layer_plus)  # [1 75 110 2]
+                # C4_attention = tf.Print(C4_attention, [tf.shape(C4_attention)], summarize=10,
+                #                               message='C4_attention')
+                # C4_attention_plus = tf.Print( C4_attention_plus, [tf.shape( C4_attention_plus)],
+                #                                    summarize=10, message=' C4_attention_plus')
+                C4_attention = C4_attention[:, :, :, 1]  # [1 75 110]
+                C4_attention_plus = C4_attention_plus[:, :, :, 1]
+                # C4_attention = C4_attention[:, :, :, 0]  # [1 75 110]
+                # C4_attention = tf.py_func(get_pred_mask, [C4_attention], [tf.float32])
+                C4_attention = tf.expand_dims(C4_attention, axis=-1)  # [1 75 110 1]
+                # add_heatmap(C4_attention, 'C4_attention_000')
+                C4_attention_plus = tf.expand_dims(C4_attention_plus, axis=-1)
+                # add_heatmap(C4_attention_plus, 'C4_attention_111')
+                C4_attention = 1 + 0.5 * C4_attention + 0.5 * C4_attention_plus
+                # C4_attention = 1 + C4_attention_plus
+                # C4_attention_stop = tf.stop_gradient(C4_attention)
+                # tf.summary.image('C3_attention', C4_attention)
+                add_heatmap(C4_attention, 'C4_attention')
+                # add_heatmap(1-_C4_attention, 'C4_attention')
+                pyramid_dict['P3'] = tf.multiply(C4_attention, pyramid_dict['P3'])
+                # P2 attention
+                h, w = tf.shape(pyramid_dict['P2'])[1], tf.shape(pyramid_dict['P2'])[2]
+                pyramid_dict['P2'] = tf.multiply(tf.image.resize_bilinear(C4_attention,
+                                                  size=[h, w],
+                                                  name='P2_attention'), pyramid_dict['P2'])
+                # P4 attention
+                h, w = tf.shape(pyramid_dict['P4'])[1], tf.shape(pyramid_dict['P4'])[2]
+                pyramid_dict['P4'] = tf.multiply(tf.image.resize_bilinear(C4_attention,
+                                                                          size=[h, w],
+                                                                          name='P4_attention'), pyramid_dict['P4'])
+                # P5 attention
+                h, w = tf.shape(pyramid_dict['P5'])[1], tf.shape(pyramid_dict['P5'])[2]
+                pyramid_dict['P5'] = tf.multiply(tf.image.resize_bilinear(C4_attention,
+                                                                          size=[h, w],
+                                                                          name='P5_attention'), pyramid_dict['P5'])
+                add_heatmap(tf.expand_dims(tf.reduce_mean(pyramid_dict['P3'], axis=-1), axis=-1), 'add_attention_after')
+                # add_heatmap(tf.expand_dims(C4[:, :, :, 0], axis=-1), 'add_attention_after_0')
+                # SE_C4 = self.squeeze_excitation_layer(C4, 1024, 16, 'SE_C4', is_training, initializer)
+
+                # tf.summary.image('add_attention_after', tf.expand_dims(tf.reduce_mean(C4, axis=-1), axis=-1))
+                # add_heatmap(tf.expand_dims(tf.reduce_mean(C4, axis=-1), axis=-1), 'add_attention_after_with_channel')
+
+        for level in range(5, 1, -1):  # range(5, 1, -1)
+            add_heatmap(pyramid_dict['P%d' % level], name='Layer%d/P%d_heat' % (level, level))
+
+        # return [P2, P3, P4, P5, P6]
+        # print("we are in Pyramid::-======>>>>")
+        # print(cfgs.LEVLES)
+        # print("base_anchor_size are: ", cfgs.BASE_ANCHOR_SIZE_LIST)
+        # print(20 * "__")
+        # return [pyramid_dict[level_name] for level_name in cfgs.LEVLES]
+        # return pyramid_dict  # return the dict. And get each level by key. But ensure the levels are consitant
+        # return list rather than dict, to avoid dict is unordered
+        if cfg.FLAGS.attention == True:
+            return [pyramid_dict[level_name] for level_name in cfg.LEVLES], C4_attention_layer,C4_attention_layer_plus
+        else:
+            return [pyramid_dict[level_name] for level_name in cfg.LEVLES]
+
+
+
+    def build_head_origin(self, is_training,initializer,initializer_bbox):
+
+        # if scope_name == 'resnet_v1_50':
+        scope_name = 'resnet_v1_101'
+        middle_num_units = 23
+        # elif scope_name == 'resnet_v1_101':
+        #     middle_num_units = 23
+        # else:
+        #     raise NotImplementedError('We only support resnet_v1_50 or resnet_v1_101 or mobilenetv2. '
+        #                               'Check your network name.')
+
+        blocks = [resnet_v1_block('block1', base_depth=64, num_units=3, stride=2),
+                  resnet_v1_block('block2', base_depth=128, num_units=4, stride=2),
+                  # use stride 1 for the last conv4 layer.
+
+                  resnet_v1_block('block3', base_depth=256, num_units=middle_num_units, stride=1)]
+        # when use fpn, stride list is [1, 2, 2]
+        # self._image = tf.Print(self._image, [tf.shape(self._image)], summarize=10, message='C4_shape')
+        with slim.arg_scope(resnet_arg_scope(is_training=False)):
+            with tf.variable_scope(scope_name, scope_name):
+                # Do the first few layers manually, because 'SAME' padding can behave inconsistently
+                # for images of different sizes: sometimes 0, sometimes 1
+                net = resnet_utils.conv2d_same(
+                    self._image, 64, 7, stride=2, scope='conv1')
+                net = tf.pad(net, [[0, 0], [1, 1], [1, 1], [0, 0]])
+                net = slim.max_pool2d(
+                    net, [3, 3], stride=2, padding='VALID', scope='pool1')
+
+        not_freezed = [False] * cfg.FLAGS.FIXED_BLOCKS + (4 - cfg.FLAGS.FIXED_BLOCKS) * [True]
+        # Fixed_Blocks can be 1~3
+        # net = tf.Print(net, [tf.shape(net)], summarize=10, message='C1_shape')
+        with slim.arg_scope(resnet_arg_scope(is_training=(is_training and not_freezed[0]))):
+            C2, end_points_C2 = resnet_v1.resnet_v1(net,
+                                                    blocks[0:1],
+                                                    global_pool=False,
+                                                    include_root_block=False,
+                                                    scope=scope_name)
+           # add_heatmap(tf.expand_dims(tf.reduce_mean(C2, axis=-1), axis=-1),
+                      #  'C2')
+       # C2 = tf.Print(C2, [tf.shape(C2)], summarize=10, message='C2_shape')
+        #end_points_C2['{}/block1/unit_2/bottleneck_v1'.format(scope_name)] = tf.Print(end_points_C2['{}/block1/unit_2/bottleneck_v1'.format(scope_name)], [tf.shape(end_points_C2['{}/block1/unit_2/bottleneck_v1'.format(scope_name)])], summarize=10, message='end_C2_shape')
+
+
+        with slim.arg_scope(resnet_arg_scope(is_training=(is_training and not_freezed[1]))):
+            C3, end_points_C3 = resnet_v1.resnet_v1(C2,
+                                                    blocks[1:2],
+                                                    global_pool=False,
+                                                    include_root_block=False,
+                                                    scope=scope_name)
+           # add_heatmap(tf.expand_dims(tf.reduce_mean(C3, axis=-1), axis=-1),
+                     #   'C3')
+
+       # C3 = tf.Print(C3, [tf.shape(C3)], summarize=10, message='C3_shape')
+      #  end_points_C3['{}/block2/unit_3/bottleneck_v1'.format(scope_name)] = tf.Print(end_points_C3['{}/block2/unit_3/bottleneck_v1'.format(scope_name)], [tf.shape(end_points_C3['{}/block2/unit_3/bottleneck_v1'.format(scope_name)])], summarize=10, message='end_C3_shape')
+
+        with slim.arg_scope(resnet_arg_scope(is_training=(is_training and not_freezed[2]))):
+            C4, end_points_C4 = resnet_v1.resnet_v1(C3,
+                                        blocks[2:3],
+                                        global_pool=False,
+                                        include_root_block=False,
+                                        scope=scope_name)
+           # C4 = tf.Print(C4, [tf.shape(C4)], summarize=10, message='C4_shape')
+          #  end_points_C4[
+             #   '{}/block3/unit_{}/bottleneck_v1'.format(scope_name, middle_num_units - 1)] = tf.Print(end_points_C4[
+                           #     '{}/block3/unit_{}/bottleneck_v1'.format(scope_name, middle_num_units - 1)], [tf.shape(end_points_C4[
+                              #  '{}/block3/unit_{}/bottleneck_v1'.format(scope_name, middle_num_units - 1)])], summarize=10, message='end_C4_shape')
+           # add_heatmap(tf.expand_dims(tf.reduce_mean(C4, axis=-1), axis=-1),
+           #             'C4')
+            #add_heatmap(tf.expand_dims(tf.reduce_mean(end_points_C2['{}/block1/unit_2/bottleneck_v1'.format(scope_name)], axis=-1), axis=-1),
+            #            'end_points_C2')
+            #add_heatmap(tf.expand_dims(
+              #  tf.reduce_mean(end_points_C3['{}/block2/unit_3/bottleneck_v1'.format(scope_name)], axis=-1), axis=-1),
+                     #   'end_points_C3')
+            #add_heatmap(tf.expand_dims(
+               # tf.reduce_mean(end_points_C4[
+                         #       '{}/block3/unit_{}/bottleneck_v1'.format(scope_name, middle_num_units - 1)], axis=-1), axis=-1),
+                     #   'end_points_C4')
+
+            # add_heatmap(tf.expand_dims(tf.reduce_mean(C4, axis=-1), axis=-1), 'C4')
+
+            # C4 = end_points_C4['{}/block3/unit_{}/bottleneck_v1'.format(scope_name, middle_num_units - 1)]
+            # C4 = tf.Print(C4, [tf.shape(C4)], summarize=10, message='_C4_shape')
+            if cfg.FLAGS.ADD_FUSION:
+
+                _C3 = slim.conv2d(end_points_C3['{}/block2/unit_3/bottleneck_v1'.format(scope_name)],
+                                  1024, [1, 1],
+                                  trainable=is_training,
+                                  weights_initializer=initializer,
+                                  activation_fn=tf.nn.relu,
+                                  scope='C3_conv3x3')  # 1024
+
+                cbam_C3 = self.cbam_block(_C3, 'cbam_C3', only_channel=True)
+                _C2 = slim.conv2d(end_points_C2['{}/block1/unit_2/bottleneck_v1'.format(scope_name)],
+                                  1024, [1, 1],
+                                  trainable=is_training,
+                                  weights_initializer=initializer,
+                                  activation_fn=tf.nn.relu,
+                                  scope='C2_conv1x1')
+                cbam_C2 = self.cbam_block(_C2, 'cbam_C2', only_channel=True)
+                C4_shape=tf.shape(C4)
+                P4=C4+tf.image.resize_bilinear(cbam_C3, (C4_shape[1], C4_shape[2]))+tf.image.resize_bilinear(cbam_C2, (C4_shape[1], C4_shape[2]))
+
+
+                C3_shape = tf.shape(end_points_C3['{}/block2/unit_3/bottleneck_v1'.format(scope_name)])
+                _P4 = tf.image.resize_bilinear(P4, (C3_shape[1], C3_shape[2]))
+                _C2_1 = tf.image.resize_bilinear(_C2, (C3_shape[1], C3_shape[2]))
+                # _C3 = self.squeeze_excitation_layer(_C3, 1024, 16, 'SE_C3', is_training, initializer_bbox)
+               # _C3 = self.cbam_block(_C3,'cbam_C3',only_channel=True)
+               #  add_heatmap(tf.expand_dims(tf.reduce_mean(_C3, axis=-1), axis=-1),
+               #              'C3_after_cbam')
+               #  _C3 = self.cbam_block(_C3, 'cbam_C3', only_channel=True)
+                P3 = _P4 + _C3+_C2_1
+                C2_shape = tf.shape(end_points_C2['{}/block1/unit_2/bottleneck_v1'.format(scope_name)])
+                P2 = tf.image.resize_bilinear(P3, (C2_shape[1], C2_shape[2]))
+                _C4 = tf.image.resize_bilinear(P4, (C2_shape[1], C2_shape[2]))
+
+                P2=P2+_C2+_C4
+                # C2_downsampling = tf.image.resize_bilinear(end_points_C2['{}/block1/unit_2/bottleneck_v1'.format(scope_name)], (C3_shape[1], C3_shape[2]))
+                #
+                # C2_downsampling = slim.conv2d(C2_downsampling,
+                #                    1024, [1, 1],
+                #                    trainable=is_training,
+                #                    weights_initializer=initializer,
+                #                    activation_fn=tf.nn.relu,
+                #                    scope='C2_conv1x1')
+                # _C2= self.cbam_block(C2_downsampling, 'cbam_C2')
+                # # _C3 = tf.Print(_C3, [tf.shape(_C3)], summarize=10, message='_C3_shape')
+                # # # _C3 = self.build_inception(end_points_C3['resnet_v1_50/block2/unit_3/bottleneck_v1'], is_training,initializer)
+                # # P3 = _C4+ _C3
+                # # C4 = tf.Print(C4, [tf.shape(C4)], summarize=10, message='C4_shape')
+                # C4_shape=tf.shape(C4)
+                # _C2=tf.image.resize_bilinear(_C2,[C4_shape[1],C4_shape[2]])
+                # _C3=tf.image.resize_bilinear(_C3,[C4_shape[1],C4_shape[2]])
+                #
+                # _C3 = self.cbam_block(_C3,'cbam_C3',only_channel=True)
+                # C4=_C2+C4+_C3
+
+            if cfg.FLAGS.attention == True:
+                with tf.variable_scope('build_C4_attention',
+                                       regularizer=slim.l2_regularizer(cfg.FLAGS.weight_decay)):
+                    # tf.summary.image('add_attention_before',
+                    #                  tf.expand_dims(tf.reduce_mean(C4, axis=-1), axis=-1))
+
+                    # SE_C4 =self.squeeze_excitation_layer(C4, 1024, 16, 'SE_C4', is_training,initializer)
+
+                    add_heatmap(tf.expand_dims(tf.reduce_mean(P3, axis=-1), axis=-1), 'add_attention_before')
+                    # add_heatmap(tf.expand_dims(C4[:, :, :, 0], axis=-1), 'add_attention_before_0')
+                    # SE_C4 = self.channel_attention(C4, 'cbam_channel', mode=2)
+                    # C4 = SE_C4 * C4
+                    # add_heatmap(tf.expand_dims(tf.reduce_mean(C4, axis=-1), axis=-1), 'add_attention_after_channel')
+                    # add_heatmap(tf.expand_dims(C4[:, :, :, 0], axis=-1), 'add_attention_after_0_channel')
+                    # C4_stop = tf.stop_gradient(C4)
+                    C4_attention_layer,C4_attention_layer_plus = self.build_attention(P3, is_training,initializer)
+
+
+                    # C4_attention_layer = self.build_inception_attention(C4_stop, is_training,initializer)
+
+                    C4_attention = tf.nn.softmax(C4_attention_layer)  # [1 75 110 2]
+                    C4_attention_plus = tf.nn.softmax(C4_attention_layer_plus)  # [1 75 110 2]
+                    # C4_attention = tf.Print(C4_attention, [tf.shape(C4_attention)], summarize=10,
+                    #                               message='C4_attention')
+                    # C4_attention_plus = tf.Print( C4_attention_plus, [tf.shape( C4_attention_plus)],
+                    #                                    summarize=10, message=' C4_attention_plus')
+                    C4_attention = C4_attention[:, :, :, 1] # [1 75 110]
+                    C4_attention_plus = C4_attention_plus[:, :, :, 1]
+                    # C4_attention = C4_attention[:, :, :, 0]  # [1 75 110]
+                    # C4_attention = tf.py_func(get_pred_mask, [C4_attention], [tf.float32])
+                    C4_attention = tf.expand_dims(C4_attention, axis=-1)  # [1 75 110 1]
+                    # add_heatmap(C4_attention, 'C4_attention_000')
+                    C4_attention_plus = tf.expand_dims( C4_attention_plus, axis=-1)
+                    # add_heatmap(C4_attention_plus, 'C4_attention_111')
+
+                    '''学习weight'''
+                    # weight= self.mask_wight(C4_attention, C4_attention_plus, 16, is_training, initializer_bbox)
+                    # C4_attention = 1 + weight[0,0] * C4_attention + weight[0,1] * C4_attention_plus
+                    '''学习weight'''
+
+                    C3_attention = 1 + 0.5*C4_attention + 0.5*C4_attention_plus
+                    C2_attention = tf.image.resize_bilinear(C3_attention, (C2_shape[1], C2_shape[2]))
+                    C4_shape = tf.shape(C4)
+                    C4_attention = tf.image.resize_bilinear(C3_attention, (C4_shape[1], C4_shape[2]))
+                    # C4_attention = 1 + C4_attention_plus
+                    # C4_attention_stop = tf.stop_gradient(C4_attention)
+                    # tf.summary.image('C3_attention', C4_attention)
+                    add_heatmap(C3_attention, 'C4_attention')
+                    # add_heatmap(1-_C4_attention, 'C4_attention')
+                    P2 = tf.multiply(C2_attention, P2)
+                    P3 = tf.multiply(C3_attention, P3)
+                    P4 = tf.multiply(C4_attention, P4)
+                    add_heatmap(tf.expand_dims(tf.reduce_mean(P3, axis=-1), axis=-1), 'add_attention_after')
+                    P5 = slim.max_pool2d(
+                        C4, [3, 3], stride=2, padding='VALID', scope='pool1')
+                    # add_heatmap(tf.expand_dims(C4[:, :, :, 0], axis=-1), 'add_attention_after_0')
+
+
+        if cfg.FLAGS.attention == True:
+            return [P2,P3,P4,P5], C4_attention_layer,C4_attention_layer_plus
+        else:
+            return [P3,C4]
+
+
+
+    def build_rpn(self, net, is_training, initializer):
+        if cfg.FLAGS.use_fpn:
+            # generate_anchors
+            all_anchors = []
+            for i in range(len(cfg.LEVLES)):
+                level_name, p = cfg.LEVLES[i], net[i]
+
+                p_h, p_w = tf.shape(p)[1], tf.shape(p)[2]
+                featuremap_height = tf.cast(p_h, tf.float32)
+                featuremap_width = tf.cast(p_w, tf.float32)
+                anchors = anchor_utils.make_anchors(base_anchor_size=cfg.BASE_ANCHOR_SIZE_LIST[i],
+                                                    anchor_scales=cfg.ANCHOR_SCALES,
+                                                    anchor_ratios=cfg.ANCHOR_RATIOS,
+                                                    featuremap_height=featuremap_height,
+                                                    featuremap_width=featuremap_width,
+                                                    stride=cfg.ANCHOR_STRIDE_LIST[i],
+                                                    name="make_anchors_for%s" % level_name)
+                all_anchors.append(anchors)
+            all_anchors = tf.concat(all_anchors, axis=0, name='all_anchors_of_FPN')
+            self._anchors=all_anchors
+
+            fpn_cls_score = []
+            fpn_box_pred = []
+            fpn_cls_score_reshape = []
+            fpn_cls_prob = []
+            for level_name, p in zip(cfg.LEVLES, net):
+                if cfg.FLAGS.SHARE_HEADS:
+                    reuse_flag = None if level_name == cfg.LEVLES[0] else True
+                    scope_list = ['rpn_conv/3x3', 'rpn_cls_score', 'rpn_bbox_pred']
+                else:
+                    reuse_flag = None
+                    scope_list = ['rpn_conv/3x3_%s' % level_name, 'rpn_cls_score_%s' % level_name,
+                                  'rpn_bbox_pred_%s' % level_name]
+
+                rpn = slim.conv2d(p, 512, [3, 3], trainable=is_training, weights_initializer=initializer,
+                                  scope=scope_list[0], reuse=reuse_flag)
+                rpn_cls_score = slim.conv2d(rpn, self._num_anchors * 2, [1, 1], stride=1, trainable=is_training,
+                                            weights_initializer=initializer, padding='VALID', activation_fn=None,
+                                            scope=scope_list[1], reuse=reuse_flag)  # stride =2 ?
+
+                rpn_box_pred = slim.conv2d(rpn, self._num_anchors * 4, [1, 1], stride=1, padding='VALID',
+                                           trainable=is_training, weights_initializer=initializer, activation_fn=None,
+                                           scope=scope_list[2], reuse=reuse_flag)
+                # rpn_cls_score_reshape = self._reshape_layer(rpn_cls_score, 2, 'rpn_cls_score_reshape_%s' % level_name)
+                # rpn_cls_prob_reshape = self._softmax_layer(rpn_cls_score_reshape,
+                #                                            'rpn_cls_prob_reshape_%s' % level_name)
+                # rpn_cls_prob = self._reshape_layer(rpn_cls_prob_reshape, self._num_anchors * 2,
+                #                                    'rpn_cls_prob_%s' % level_name)
+                # rpn_box_pred = tf.Print(rpn_box_pred, [tf.shape(rpn_box_pred)], summarize=10, message='rpn_box_pred')
+
+                rpn_box_pred = tf.reshape(rpn_box_pred, [-1, 4])
+                rpn_cls_score = tf.reshape(rpn_cls_score, [-1, 2])
+                # rpn_cls_prob = tf.Print(rpn_cls_prob, [tf.shape(rpn_cls_prob)], summarize=10, message='rpn_cls_prob')
+                # rpn_cls_score_reshape = tf.reshape(rpn_cls_score_reshape, [-1, 2])
+
+                fpn_cls_score.append(rpn_cls_score)
+                fpn_box_pred.append(rpn_box_pred)
+                # fpn_cls_score_reshape.append(rpn_cls_score_reshape)
+                # fpn_cls_prob.append(rpn_cls_prob)
+
+            fpn_cls_score = tf.concat(fpn_cls_score, axis=0, name='fpn_cls_score')
+            fpn_box_pred = tf.concat(fpn_box_pred, axis=0, name='fpn_box_pred')
+            fpn_cls_prob = slim.softmax(fpn_cls_score, scope='fpn_cls_prob')
+            # fpn_cls_score = tf.Print(fpn_cls_score, [tf.shape(fpn_cls_score)], summarize=10, message='fpn_cls_score')
+            # print(fpn_box_pred)
+            # fpn_cls_prob = tf.concat(fpn_cls_prob, axis=0, name='fpn_cls_prob')
+            # fpn_cls_prob = tf.Print(fpn_cls_prob, [tf.shape(fpn_cls_prob)], summarize=10, message='fpn_cls_prob')
+            # fpn_cls_prob =tf.concat(fpn_cls_prob, axis=0, name='fpn_box_prob')
+            # fpn_cls_score_reshape = tf.concat(fpn_cls_score_reshape, axis=0, name='fpn_box_pred_reshape')
+            return fpn_cls_prob, fpn_box_pred, fpn_cls_score
+
+
+
+
+
+    def build_proposals(self, is_training, fpn_cls_prob, fpn_box_pred, rpn_cls_score):
+        if cfg.FLAGS.use_fpn:
+            with tf.variable_scope('postprocess_FPN'):
+                    #需要改成篇【none，5】，已改
+                    if cfg.FLAGS.origin:
+                        rois, roi_scores = self._proposal_layer(fpn_cls_prob, fpn_box_pred, "rois")
+                    else:
+                        rois, roi_scores = postprocess_rpn_proposals(rpn_bbox_pred=fpn_box_pred,
+                                                                     rpn_cls_prob=fpn_cls_prob,
+                                                                     img_shape=self._im_info,
+                                                                     anchors=self._anchors,
+                                                                     is_training=is_training)
+            if is_training:
+                with tf.variable_scope('sample_anchors_minibatch'):
+                    fpn_labels, fpn_bbox_targets = \
+                        tf.py_func(
+                            anchor_target_layer,
+                            [self._gt_boxes, self._im_info, self._anchors,self._num_classes],
+                            [tf.float32, tf.float32])
+                    fpn_bbox_targets = tf.reshape(fpn_bbox_targets, [-1, 4])    # loss用
+                    fpn_labels = tf.to_int32(fpn_labels, name="to_int32")
+                    fpn_labels = tf.reshape(fpn_labels, [-1])
+
+                    self._anchor_targets['rpn_labels'] = fpn_labels
+                    self._anchor_targets['rpn_bbox_targets'] = fpn_bbox_targets
+                '''接原版'''
+                with tf.control_dependencies([fpn_labels]):
+                    #输入的roi[none,5],输出【cfg.FLAGS.batch_size，5]；roi_scores.set_shape([cfg.FLAGS.batch_size])
+                    rois, _ = self._proposal_target_layer(rois, roi_scores, "rpn_rois")
+        else:
+            if is_training:
+                rois, roi_scores = self._proposal_layer(fpn_cls_prob, fpn_box_pred, "rois")
+                # rois = (post_nms_topN,5),因为batchsize=1 第一列全为0, roi+scores = (post_nms_topN,1)
+                rpn_labels = self._anchor_target_layer(rpn_cls_score, "anchor")  # (1, 1, A * height, width)
+
+                # Try to have a deterministic order for the computing graph, for reproducibility
+                with tf.control_dependencies([rpn_labels]):  # 在执行完rpn_labels操作之后，才能执行下面的操作
+                    rois, _ = self._proposal_target_layer(rois, roi_scores, "rpn_rois")
+            else:
+                if cfg.FLAGS.test_mode == 'nms':
+                    rois, _ = self._proposal_layer(fpn_cls_prob, fpn_box_pred, "rois")
+                elif cfg.FLAGS.test_mode == 'top':
+                    rois, _ = self._proposal_top_layer(fpn_cls_prob, fpn_box_pred, "rois")
+                else:
+                    raise NotImplementedError
+        return rois
+    # def build_predictions(self, net, rois, is_training, initializer, initializer_bbox):
+    #
+    #     # Crop image ROIs
+    #     pool5 = self._crop_pool_layer(net, rois, "pool5")
+    #     pool5_flat = slim.flatten(pool5, scope='flatten')
+    #
+    #     # Fully connected layers
+    #     fc6 = slim.fully_connected(pool5_flat, 4096, scope='fc6')
+    #     if is_training:
+    #         fc6 = slim.dropout(fc6, keep_prob=0.5, is_training=True, scope='dropout6')
+    #
+    #     fc7 = slim.fully_connected(fc6, 4096, scope='fc7')
+    #     if is_training:
+    #         fc7 = slim.dropout(fc7, keep_prob=0.5, is_training=True, scope='dropout7')
+    #
+    #     # Scores and predictions
+    #     cls_score = slim.fully_connected(fc7, self._num_classes, weights_initializer=initializer, trainable=is_training, activation_fn=None, scope='cls_score')
+    #     cls_prob = self._softmax_layer(cls_score, "cls_prob")
+    #     bbox_prediction = slim.fully_connected(fc7, self._num_classes * 4, weights_initializer=initializer_bbox, trainable=is_training, activation_fn=None, scope='bbox_pred')
+    #
+    #     return cls_score, cls_prob, bbox_prediction
+
+    def build_predictions(self, net, rois, is_training, initializer, initializer_bbox):
+        if cfg.FLAGS.use_2fc:
+            with tf.variable_scope('faster_rcnn', 'faster_rcnn'):
+                pool5 = self._crop_pool_layer(net, rois, "pool5")
+                inputs = slim.flatten(inputs=pool5, scope='flatten_inputs')
+                fc6 = slim.fully_connected(inputs, num_outputs=1024, scope='fc6')
+                # if is_training:
+                #     fc6 = slim.dropout(fc6, keep_prob=0.5, is_training=True, scope='dropout1')
+                fc7 = slim.fully_connected(fc6, num_outputs=1024, scope='fc7')
+                # if is_training:
+                #     fc7 = slim.dropout(fc7, keep_prob=0.5, is_training=True, scope='dropout7')
+        elif cfg.FLAGS.use_incep:
+            with tf.variable_scope('faster_rcnn', 'faster_rcnn'):
+                pool5 = self._crop_pool_layer(net, rois, "pool5")
+                featrue_map=self.build_inception(pool5,is_training,initializer,'incp1')
+                featrue_map = self.build_inception(featrue_map,is_training,initializer,'incp2')
+                featrue_map = self.build_inception(featrue_map,is_training,initializer,'incp3')
+                featrue_map = self.build_inception(featrue_map,is_training,initializer,'incp4')
+                fc7 = tf.reduce_mean(featrue_map, axis=[1, 2], keep_dims=False, name='global_average_pooling')
+        else:
+            scope_name = 'resnet_v1_101'
+            pool5 = self._crop_pool_layer(net, rois, "pool5")
+            # pool5 = slim.conv2d(pool5, 1024, [1, 1],
+            #                                   trainable=is_training,
+            #                                   weights_initializer=initializer,
+            #                                   scope='pool5_conv1x1')
+            block4 = [resnet_v1_block('block4', base_depth=512, num_units=3, stride=1)]
+
+            with slim.arg_scope(resnet_arg_scope(is_training=is_training)):
+                C5, _ = resnet_v1.resnet_v1(pool5,
+                                            block4,
+                                            global_pool=False,
+                                            include_root_block=False,
+                                            scope=scope_name)
+                # C5 = tf.Print(C5, [tf.shape(C5)], summarize=10, message='C5_shape')
+                fc7 = tf.reduce_mean(C5, axis=[1, 2], keep_dims=False, name='global_average_pooling')
+
+
+        # Scores and predictions
+        with tf.variable_scope('faster_rcnn', 'faster_rcnn'):
+            cls_score = slim.fully_connected(fc7, self._num_classes, weights_initializer=initializer,
+                                             trainable=is_training, activation_fn=None, scope='cls_score')
+            cls_prob = self._softmax_layer(cls_score, "cls_prob")
+            bbox_prediction = slim.fully_connected(fc7, self._num_classes * 4, weights_initializer=initializer_bbox,
+                                                   trainable=is_training, activation_fn=None, scope='bbox_pred')
+            if cfg.FLAGS.pre_ro == True:
+                ro_bbox_prediction = slim.fully_connected(fc7, self._num_classes * 5,
+                                                          weights_initializer=initializer_bbox,
+                                                          trainable=is_training, activation_fn=None,
+                                                          scope='ro_bbox_pred')
+            if cfg.FLAGS.use_uplevel_labels == True:
+                cls_score_uplevel = slim.fully_connected(fc7, cfg.FLAGS.uplevel_len, weights_initializer=initializer,
+                                                         trainable=is_training,
+                                                         activation_fn=None, scope='uplevel_cls_score')
+                cls_prob_uplevel = self._softmax_layer(cls_score_uplevel, "uplevel_cls_prob")
+                # cls_score_uplevel_plus = slim.fully_connected(fc7, 2, weights_initializer=initializer,
+                #                                          trainable=is_training,
+                #                                          activation_fn=None, scope='uplevel_cls_score_plus')
+                # cls_prob_uplevel_plus = self._softmax_layer(cls_score_uplevel_plus, "uplevel_cls_prob_plus")
+
+            if cfg.FLAGS.pre_ro == True:
+                if cfg.FLAGS.use_uplevel_labels == True:
+                    return cls_score, cls_prob, bbox_prediction, cls_score_uplevel, cls_prob_uplevel,ro_bbox_prediction
+                else:
+                    return cls_score, cls_prob, bbox_prediction, ro_bbox_prediction
+            else:
+                if cfg.FLAGS.use_uplevel_labels == True:
+                    return cls_score, cls_prob, bbox_prediction, cls_score_uplevel, cls_prob_uplevel
+                else:
+                    return cls_score, cls_prob, bbox_prediction
+
+
+    def build_predictions_with_fusion_roi(self, C2, C3, C4, C5, rois, is_training, initializer, initializer_bbox):
+
+        # Crop image ROIs
+        pool5 = self._crop_pool_layer_fusion(C2, C3, C4, C5, rois, "pool5")
+        pool5=slim.conv2d(pool5, 512, [1, 1], trainable=is_training, weights_initializer=initializer,
+                    padding='VALID', activation_fn=None, scope='pool5_channel_reset')
+        pool5_flat = slim.flatten(pool5, scope='flatten')
+
+        # Fully connected layers
+        fc6 = slim.fully_connected(pool5_flat, 4096, scope='fc6')
+        if is_training:
+            fc6 = slim.dropout(fc6, keep_prob=0.5, is_training=True, scope='dropout6')
+
+        fc7 = slim.fully_connected(fc6, 4096, scope='fc7')
+        if is_training:
+            fc7 = slim.dropout(fc7, keep_prob=0.5, is_training=True, scope='dropout7')
+
+        # Scores and predictions
+        cls_score = slim.fully_connected(fc7, self._num_classes, weights_initializer=initializer, trainable=is_training, activation_fn=None, scope='cls_score')
+        cls_prob = self._softmax_layer(cls_score, "cls_prob")
+        bbox_prediction = slim.fully_connected(fc7, self._num_classes * 4, weights_initializer=initializer_bbox, trainable=is_training, activation_fn=None, scope='bbox_pred')
+        if cfg.FLAGS.use_uplevel_labels == True:
+            cls_score_uplevel = slim.fully_connected(fc7, cfg.FLAGS.uplevel_len, weights_initializer=initializer, trainable=is_training,
+                                                     activation_fn=None, scope='uplevel_cls_score')
+            cls_prob_uplevel = self._softmax_layer(cls_score_uplevel, "uplevel_cls_prob")
+            # bbox_prediction_uplebal = slim.fully_connected(fc7, 1 * 4, weights_initializer=initializer_bbox,
+            #                                        trainable=is_training, activation_fn=None, scope='bbox_pred')
+            return cls_score, cls_prob, bbox_prediction, cls_score_uplevel, cls_prob_uplevel
+        else:
+            return cls_score, cls_prob, bbox_prediction
+
+    # def squeeze_excitation_layer(self,input_x, out_dim, ratio, layer_name, is_training):
+    #     with tf.name_scope(layer_name):
+    #         # Global_Average_Pooling
+    #         squeeze = tf.reduce_mean(input_x, [1, 2])
+    #
+    #         excitation = slim.fully_connected(inputs=squeeze,
+    #                                           num_outputs=out_dim // ratio,
+    #                                           weights_initializer=cfgs.BBOX_INITIALIZER,
+    #                                           activation_fn=tf.nn.relu,
+    #                                           trainable=is_training,
+    #                                           scope=layer_name + '_fully_connected1')
+    #
+    #         excitation = slim.fully_connected(inputs=excitation,
+    #                                           num_outputs=out_dim,
+    #                                           weights_initializer=cfgs.BBOX_INITIALIZER,
+    #                                           activation_fn=tf.nn.sigmoid,
+    #                                           trainable=is_training,
+    #                                           scope=layer_name + '_fully_connected2')
+    #
+    #         excitation = tf.reshape(excitation, [-1, 1, 1, out_dim])
+    #
+    #         # scale = input_x * excitation
+    #
+    #         return excitation
+
+    def build_inception(self, inputs, is_training,initializer,scope):
+        with slim.arg_scope([slim.conv2d, slim.avg_pool2d, slim.max_pool2d],
+                            stride=1, padding='SAME'):
+            with tf.variable_scope('Branch_0'):
+                branch_0 = slim.conv2d(inputs, 384, [1, 1],
+                                       trainable=is_training,
+                                       weights_initializer=initializer,
+                                       activation_fn=tf.nn.relu,
+                                       scope=scope+'conv2d_0a_1x1')
+            with tf.variable_scope('Branch_1'):
+                branch_1 = slim.conv2d(inputs, 192, [1, 1],
+                                       trainable=is_training,
+                                       weights_initializer=initializer,
+                                       activation_fn=tf.nn.relu,
+                                       scope=scope+'conv2d_0a_1x1')
+                branch_1 = slim.conv2d(branch_1, 224, [1, 7],
+                                       trainable=is_training,
+                                       weights_initializer=initializer,
+                                       activation_fn=tf.nn.relu,
+                                       scope=scope+'conv2d_0b_1x7')
+                branch_1 = slim.conv2d(branch_1, 256, [7, 1],
+                                       trainable=is_training,
+                                       weights_initializer=initializer,
+                                       activation_fn=tf.nn.relu,
+                                       scope=scope+'conv2d_0c_7x1')
+            with tf.variable_scope('Branch_2'):
+                branch_2 = slim.conv2d(inputs, 192, [1, 1],
+                                       trainable=is_training,
+                                       weights_initializer=initializer,
+                                       activation_fn=tf.nn.relu,
+                                       scope=scope+'conv2d_0a_1x1')
+                branch_2 = slim.conv2d(branch_2, 192, [7, 1],
+                                       trainable=is_training,
+                                       weights_initializer=initializer,
+                                       activation_fn=tf.nn.relu,
+                                       scope=scope+'conv2d_0b_7x1')
+                branch_2 = slim.conv2d(branch_2, 224, [1, 7],
+                                       trainable=is_training,
+                                       weights_initializer=initializer,
+                                       activation_fn=tf.nn.relu,
+                                       scope=scope+'Conv2d_0c_1x7')
+                branch_2 = slim.conv2d(branch_2, 224, [7, 1],
+                                       trainable=is_training,
+                                       weights_initializer=initializer,
+                                       activation_fn=tf.nn.relu,
+                                       scope=scope+'conv2d_0d_7x1')
+                branch_2 = slim.conv2d(branch_2, 256, [1, 7],
+                                       trainable=is_training,
+                                       weights_initializer=initializer,
+                                       activation_fn=tf.nn.relu,
+                                       scope=scope+'conv2d_0e_1x7')
+            with tf.variable_scope('Branch_3'):
+                branch_3 = slim.avg_pool2d(inputs, [3, 3], scope='avgPool_0a_3x3')
+                branch_3 = slim.conv2d(branch_3, 128, [1, 1],
+                                       trainable=is_training,
+                                       weights_initializer=initializer,
+                                       activation_fn=tf.nn.relu,
+                                       scope='conv2d_0b_1x1')
+            inception_out = tf.concat(axis=3, values=[branch_0, branch_1, branch_2, branch_3])
+            return inception_out
+
+    def build_inception_attention(self,inputs, is_training,initializer):
+        """Builds Inception-B block for Inception v4 network."""
+        # By default use stride=1 and SAME padding
+        inception_out = self.build_inception(inputs, is_training,initializer)
+
+        inception_attention_out = slim.conv2d(inception_out, 2, [3, 3],
+                                              trainable=is_training,
+                                              weights_initializer=initializer,
+                                              activation_fn=None,
+                                              scope='inception_attention_out')
+        return inception_attention_out
+
+    def squeeze_excitation_layer(self,input_x, out_dim, ratio, layer_name, is_training,initializer_bbox):
+        with tf.name_scope(layer_name):
+            # Global_Average_Pooling
+            squeeze = tf.reduce_mean(input_x, [1, 2])
+
+            excitation = slim.fully_connected(inputs=squeeze,
+                                              num_outputs=out_dim // ratio,
+                                              weights_initializer=initializer_bbox,
+                                              activation_fn=tf.nn.relu,
+                                              trainable=is_training,
+                                              scope=layer_name + '_fully_connected1')
+
+            excitation = slim.fully_connected(inputs=excitation,
+                                              num_outputs=out_dim,
+                                              weights_initializer=initializer_bbox,
+                                              activation_fn=tf.nn.sigmoid,
+                                              trainable=is_training,
+                                              scope=layer_name + '_fully_connected2')
+
+            excitation = tf.reshape(excitation, [-1, 1, 1, out_dim])
+
+            # scale = input_x * excitation
+
+            return excitation
+
+    def  cbam_block(self,input_feature, name, only_channel=False,ratio=8):
+        """Contains the implementation of Convolutional Block Attention Module(CBAM) block.
+        As described in https://arxiv.org/abs/1807.06521.
+        """
+
+        with tf.variable_scope(name):
+
+            attention_feature = self.channel_attention(input_feature, 'ch_at', ratio,mode=1)
+            if not only_channel:
+                attention_feature = self.spatial_attention(attention_feature, 'sp_at')
+            print("CBAM Hello")
+        return attention_feature
+
+
+    def channel_attention(self,input_feature, name, ratio=8,mode=1):
+
+        kernel_initializer = tf.contrib.layers.variance_scaling_initializer()
+        bias_initializer = tf.constant_initializer(value=0.0)
+
+        with tf.variable_scope(name):
+            channel = input_feature.get_shape()[-1]
+            avg_pool = tf.reduce_mean(input_feature, axis=[1, 2], keepdims=True)
+
+            assert avg_pool.get_shape()[1:] == (1, 1, channel)
+            avg_pool = tf.layers.dense(inputs=avg_pool,
+                                       units=channel // ratio,
+                                       activation=tf.nn.relu,
+                                       kernel_initializer=kernel_initializer,
+                                       bias_initializer=bias_initializer,
+                                       name='mlp_0',
+                                       reuse=None)
+            assert avg_pool.get_shape()[1:] == (1, 1, channel // ratio)
+            avg_pool = tf.layers.dense(inputs=avg_pool,
+                                       units=channel,
+                                       kernel_initializer=kernel_initializer,
+                                       bias_initializer=bias_initializer,
+                                       name='mlp_1',
+                                       reuse=None)
+            assert avg_pool.get_shape()[1:] == (1, 1, channel)
+
+            max_pool = tf.reduce_max(input_feature, axis=[1, 2], keepdims=True)
+            assert max_pool.get_shape()[1:] == (1, 1, channel)
+            max_pool = tf.layers.dense(inputs=max_pool,
+                                       units=channel // ratio,
+                                       activation=tf.nn.relu,
+                                       name='mlp_0',
+                                       reuse=True)
+            assert max_pool.get_shape()[1:] == (1, 1, channel // ratio)
+            max_pool = tf.layers.dense(inputs=max_pool,
+                                       units=channel,
+                                       name='mlp_1',
+                                       reuse=True)
+            assert max_pool.get_shape()[1:] == (1, 1, channel)
+
+            scale = tf.sigmoid(avg_pool + max_pool, 'sigmoid')
+        if mode == 1:
+            return input_feature * scale
+        else:
+            return  scale
+
+    def spatial_attention(self,input_feature, name):
+        kernel_size = 7
+        kernel_initializer = tf.contrib.layers.variance_scaling_initializer()
+        with tf.variable_scope(name):
+            avg_pool = tf.reduce_mean(input_feature, axis=[3], keepdims=True)
+            assert avg_pool.get_shape()[-1] == 1
+            max_pool = tf.reduce_max(input_feature, axis=[3], keepdims=True)
+            assert max_pool.get_shape()[-1] == 1
+            concat = tf.concat([avg_pool, max_pool], 3)
+            assert concat.get_shape()[-1] == 2
+
+            concat = tf.layers.conv2d(concat,
+                                      filters=1,
+                                      kernel_size=[kernel_size, kernel_size],
+                                      strides=[1, 1],
+                                      padding="same",
+                                      activation=None,
+                                      kernel_initializer=kernel_initializer,
+                                      use_bias=False,
+                                      name='conv')
+            assert concat.get_shape()[-1] == 1
+            concat = tf.sigmoid(concat, 'sigmoid')
+
+        return input_feature * concat
+
+
+
