@@ -28,45 +28,52 @@ How to use
 ### 1. Download the code and prepare for training.
 
 ```
-$ git clone https://github.com/ultralytics/yolov5  # clone repo
-$ cd EIRNet
-$ pip install -r requirements.txt  # install
+git clone https://github.com/ultralytics/yolov5  # clone repo
+cd EIRNet
+pip install -r requirements.txt  # install
 ```
 
 ### 2. Compile
 
 For linux:
 ```
-$ cd ./data/coco/PythonAPI
-$ python setup.py build_ext --inplace
-$ python setup.py build_ext install
-$ cd ./lib/utils　　
-$ python setup.py build_ext --inplace
+cd ./data/coco/PythonAPI
+python setup.py build_ext --inplace
+python setup.py build_ext install
+cd ./lib/utils　　
+python setup.py build_ext --inplace
 ```
 For windows:
 ```
-$ cd /d .\data\coco\PythonAPI
-$ python setup.py build_ext --inplace
-$ python setup.py build_ext install
-$ cd /d .\lib\utils　　
-$ python setup.py build_ext --inplace
+cd /d .\data\coco\PythonAPI
+python setup.py build_ext --inplace
+python setup.py build_ext install
+cd /d .\lib\utils　　
+python setup.py build_ext --inplace
 ```
 ### 3. Prepare data and pretrained model
 
 Put all dataset images under ./data/VOCdevkit2007/VOC2007/JPEGImages
+
 Put all dataset annotations (VOC format) under ./data/VOCdevkit2007/VOC2007/Annotations
+
 Put train.txt, val.txt, test.txt, and trainval.txt under ./data/VOCdevkit2007/VOC2007/ImageSets/Main
 
 Download pretrained weight from [our pretrained model][2] (based on ResNet101) with access code **1596** or [office model][3].
 
 ### 4. Train
 Modify ./lib/config/config.py:
+
 'network' in Line10
 
 If you want to train your own dataset, please modify:
+
 ./lib/config/config.py: 'dataset' in Line20, 'image_ext' in Line21, 'uplevel_len' in Line22
+
 ./lib/datasets/pascal_voc.py: 'CLASSES' in Line24
+
 ./lib/layer_utils/uplevel_utils.py: 'uplevelmap' in Line4
+
 ./lib/layer_utils/cls_weight.py: 'cls_weight_L2' in Line4
 
 The default cache files in ./data/cache and ./data/VOCdevkit2007/annotations_cache is obtained from DOSR. 
@@ -81,12 +88,12 @@ $ python train.py
 Note: At the beginning of the train, there may be some assert errors. The reason is there is an assert 'fg_num>0' in function 'iou_rotate_calculate3' of ./lib/utils/iou_rotate.py. At the beginning of the train, the network gets no foreground，thus, network cannot comput IoU between the predicted foreground box and its corresponding groundtruth bounding box. Such assert errors will **not** affect training process, you can ignore it. You can use our pretrained model to reduce such assert errors.
 ### 5. Demo
 ```
-$ python demo.py
+python demo.py
 ```
 
 ### 6. Eval
 ```
-$ python eval_r.py
+python eval_r.py
 ```
 
 
