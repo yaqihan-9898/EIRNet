@@ -27,7 +27,7 @@ How to use
 ### 1. Download the code and prepare for training.
 
 ```
-git clone https://github.com/ultralytics/yolov5  # clone repo
+git clone https://github.com/yaqihan-9898/EIRNet  # clone repo
 cd EIRNet
 pip install -r requirements.txt  # install
 ```
