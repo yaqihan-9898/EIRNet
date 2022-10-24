@@ -1,11 +1,10 @@
 # EIRNet
 
-This is the code of ["Fine-Grained Recognition for Oriented Ship Against Complex Scenes in Optical Remote in Remote Sensing Images"][4]. 
-
+This is the code of paper ["Fine-Grained Recognition for Oriented Ship Against Complex Scenes in Optical Remote in Remote Sensing Images"][4].
 
 Introduction
 --
-Efficient Information Reuse Network (EIRNet) is a two-stage end-to-end network designed for fine-grained ship recognition in remote sensing images. We will update the detaied structure of EIRNet after the acception of our manuscript :)
+Efficient Information Reuse Network (EIRNet) is a two-stage end-to-end network designed for fine-grained ship recognition in remote sensing images. 
 
 We tested EIRNet on two datasets: HRSC2016 and [DOSR][1]. HRSC2016 is a widely used dataset for fine-grained ship recognition. DOSR is a new fine-grained ship recognition dataset collected by ourselves with more complex scenes. Extensive experiments demonstrate our EIRNet achieves state-of-the-art performance on DOSR and HRSC2016.
 
