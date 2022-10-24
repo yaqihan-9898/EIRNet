@@ -1,7 +1,7 @@
 # EIRNet
 
-Our paper "Fine-Grained Recognition for Oriented Ship Against Complex Scenes in Optical Remote in Remote Sensing Images" is under submission. We decide to publish our code in advance.
-Note: This is an early version of the code. We will update it in the future.
+This is the code of ["Fine-Grained Recognition for Oriented Ship Against Complex Scenes in Optical Remote in Remote Sensing Images"][4]. 
+
 
 Introduction
 --
@@ -100,3 +100,4 @@ python eval_r.py
 [1]:https://github.com/yaqihan-9898/DOSR
 [2]: https://pan.baidu.com/s/1j-WRmj8da2yHsZP1odXfHg
 [3]: https://github.com/tensorflow/models/tree/master/research/slim
+[4]:https://ieeexplore.ieee.org/document/9591580/
